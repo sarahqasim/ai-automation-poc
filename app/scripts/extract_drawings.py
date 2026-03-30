@@ -31,6 +31,7 @@ Requires:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -104,19 +105,35 @@ Return ONLY a valid JSON object with two keys:
 }
 """
 
-_FOLLOWUP_PROMPT = """The previous extraction found these equipment rows: {found}
+_FOLLOWUP_PROMPT = """The previous extraction found these schedules and equipment rows:
+{found}
 
-Look again at the drawing. Are there ANY unit-tagged equipment rows that were NOT in that list?
-Common ones that are sometimes missed: Exhaust Fans (EF-x), Gravity Ventilators (GV-x),
-Split-Type AC units (AC-x.x / ACCU-x.x), Condensate Drain Pumps (CP-x-x), VAV Boxes (VAV-x.x),
-Sound Attenuators (ST-x), Fan Coil Units (FCU-x).
+Look at the drawing again very carefully.
 
-For any rows NOT already listed, return them in the same JSON array format.
-If nothing is missing, return [].
+FIRST — Are there any entire schedule TABLES that were completely missed?
+Common overlooked schedule types:
+  Exhaust Fan Schedule, Gravity Ventilator Schedule, Split-Type / VRF AC Schedule,
+  Condensate Drain Pump Schedule, VAV Box Schedule, Sound Attenuator Schedule,
+  Fan Coil Unit Schedule, Energy Recovery Unit Schedule, Heat Pump Schedule,
+  Rooftop Unit Schedule, Cabinet Unit Heater Schedule, Unit Ventilator Schedule,
+  Pumps Schedule, Radiation / Convector Schedule.
+Look in every corner and margin of the drawing for small tables that may have been missed.
+
+SECOND — Within already-found schedules, are there any individual unit-tagged rows missing?
+
+Return ALL missed rows (from both missed tables and missed rows in found tables)
+in the same JSON array format. If nothing is missing, return [].
 """
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+_EXTRACTION_CACHE: dict[str, list] = {}
+
+def _pdf_hash(path: str) -> str:
+    """MD5 of the PDF file contents — used as cache key."""
+    with open(path, "rb") as f:
+        return hashlib.md5(f.read()).hexdigest()
 
 def _read_pdf_b64(path: str) -> str:
     with open(path, "rb") as f:
@@ -208,6 +225,12 @@ def _merge_rows(existing: list, new_rows: list) -> list:
 def _process_single_pdf(pdf_path: str, client: anthropic.Anthropic) -> list:
     """Extract all equipment schedule rows from one PDF using the native document API."""
     source = Path(pdf_path).name
+
+    # Return cached result if this exact PDF was already processed
+    cache_key = _pdf_hash(pdf_path)
+    if cache_key in _EXTRACTION_CACHE:
+        return _EXTRACTION_CACHE[cache_key]
+
     pdf_b64 = _read_pdf_b64(pdf_path)
 
     doc_block = {
@@ -223,6 +246,7 @@ def _process_single_pdf(pdf_path: str, client: anthropic.Anthropic) -> list:
     resp1 = client.beta.messages.create(
         model=MODEL,
         max_tokens=4096,
+        temperature=0,
         betas=["pdfs-2024-09-25"],
         messages=[{
             "role": "user",
@@ -252,6 +276,7 @@ def _process_single_pdf(pdf_path: str, client: anthropic.Anthropic) -> list:
     resp2 = client.beta.messages.create(
         model=MODEL,
         max_tokens=4096,
+        temperature=0,
         betas=["pdfs-2024-09-25"],
         messages=[
             {
@@ -278,7 +303,9 @@ def _process_single_pdf(pdf_path: str, client: anthropic.Anthropic) -> list:
     rows2 = [r for r in rows2 if _valid_tag(str(r.get("equipment_name", "")))]
     rows2 = [_clean_row(r, source) for r in rows2]
 
-    return _merge_rows(rows1, rows2)
+    result = _merge_rows(rows1, rows2)
+    _EXTRACTION_CACHE[cache_key] = result
+    return result
 
 
 # ── Public interface ──────────────────────────────────────────────────────────

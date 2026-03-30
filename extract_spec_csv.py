@@ -1,8 +1,12 @@
 """
-Extract section, manufacturers, warranty, training, and spare parts from spec PDFs → CSV.
-Requires: pypdf, anthropic (optional, for warranty). Set ANTHROPIC_API_KEY for warranty extraction.
+Extract key equipment details from specification PDFs and save them to CSV.
 
-Warranty uses Claude Sonnet by default; override with ANTHROPIC_WARRANTY_MODEL if needed.
+The script reads each PDF and tries to pull:
+- section number
+- manufacturers
+- warranty text 
+- training requirement
+- spare parts
 """
 
 from __future__ import annotations
@@ -32,9 +36,7 @@ except ImportError:
     _anthropic_client = None
 
 
-# -----------------------------------------------------------------------------
-# PDF text → lines
-# -----------------------------------------------------------------------------
+# Read all text from a PDF and split it into clean lines.
 
 
 def extract_lines(pdf_path: Path | str) -> list[str]:
@@ -59,9 +61,7 @@ def extract_section(lines: list[str]) -> str:
     return ""
 
 
-# -----------------------------------------------------------------------------
-# Manufacturers + warranty blocks (preserve newlines per PDF line)
-# -----------------------------------------------------------------------------
+# Finds and captures manufacturer / warranty blocks.
 
 
 def _manufacturer_capture_stop(upper_line: str) -> bool:
@@ -76,9 +76,8 @@ def _manufacturer_capture_stop(upper_line: str) -> bool:
     return False
 
 
-# Only treat a line as leaving the WARRANTY block when it looks like the next
-# spec subsection heading (e.g. "1.08 TRAINING"). A bare "\d+\.\d+\s" match is
-# unsafe: it fires on "2.0 tons", "1.5 years" style lines and drops bullet warranties.
+# End warranty capture only when the next real subsection starts.
+
 _WARRANTY_EXIT = re.compile(
     r"^\s*\d{1,2}\.\d{1,3}\s+"
     r"(?:TRAINING|SUBMITTAL|SUBMITTALS|DELIVERY|STORAGE|HANDLING|"
@@ -95,8 +94,8 @@ def _warranty_block_should_end(line: str) -> bool:
         return False
     if _WARRANTY_EXIT.match(s):
         return True
-    # Generic "1.08 TITLE" style break (two-part section ID + uppercase title), but not
-    # lines that still read like warranty content.
+    # Handle generic subsection headers like "1.08 TITLE",
+    # but do not stop if the line still clearly talks about warranty.
     if re.match(r"^\d{1,2}\.\d{1,3}\s+\d", s):
         return False
     m = re.match(r"^\d{1,2}\.\d{1,3}\s+(.+)$", s)
@@ -105,14 +104,14 @@ def _warranty_block_should_end(line: str) -> bool:
     tail = m.group(1).strip()
     if len(tail) < 4:
         return False
-    # Still warranty-ish: keep capturing
+    # If it still looks like warranty language, keep collecting lines.
     if re.search(
         r"\b(warrant|month|year|labor|vfd|wheel|casing|recovery|rust|substantial\s+completion)\b",
         tail,
         re.I,
     ):
         return False
-    # All-caps or leading capital section title
+    # Likely next section title.
     letters = re.sub(r"[^A-Za-z]+", "", tail)
     if len(letters) >= 6 and letters.isupper():
         return True
@@ -121,8 +120,8 @@ def _warranty_block_should_end(line: str) -> bool:
 
 def extract_warranty_block_text(lines: list[str]) -> str:
     """
-    Collect lines from the WARRANTY subsection only.
-    Safer than relying on parse_document alone when PDF line breaks interact with state machine.
+    Collect only the WARRANTY subsection lines.
+    This is more reliable when PDF line breaks make state-based parsing messy.
     """
     parts: list[str] = []
     capture = False
@@ -172,7 +171,7 @@ def parse_document(lines: list[str]) -> dict[str, str]:
     return results
 
 
-# Prose / spec language — not brand names (used after splitting PDF-merge artifacts on "/")
+# Used to filter out prose from manufacturer results.
 _MANU_PROSE = re.compile(
     r"subject\s+to\s+compliance|"
     r"following\s+manufacturers|"
@@ -205,7 +204,7 @@ _MANU_PROSE = re.compile(
     re.I,
 )
 
-# Category headings merged with lists, e.g. "Pumps Units:", "Heat Recovery Units:"
+# Category heading patterns to be ignored
 _MANU_CATEGORY_HEADING = re.compile(
     r"^pumps?\s+units\s*:?\s*$|"
     r"^heat\s+pumps?\s+units\s*:?\s*$|"
@@ -217,7 +216,7 @@ _MANU_CATEGORY_HEADING = re.compile(
     re.I,
 )
 
-# Sheet / header fragments like (CONSTANT VOLUME SYSTEM) 15934 - 52
+# Header-like fragments that are not manufacturer names.
 _MANU_SHEET_OR_HEADER = re.compile(
     r"\(\s*[A-Z][A-Z\s\-]{3,}\s*\)|"  # (CONSTANT VOLUME SYSTEM)
     r"\b\d{4,}\s*-\s*\d{2,}\b",  # 15934 - 52
@@ -232,17 +231,17 @@ _MANU_SENTENCE_STOPWORDS = re.compile(
 
 
 def _looks_like_manufacturer_name(s: str) -> bool:
-    """Filter spec prose / merged PDF junk; keep short brand-like tokens."""
+    """Return True only for strings that look like actual manufacturer names."""
     t = s.strip()
     if not t:
         return False
-    # Subsection labels always end with ":" — never strip before this check
+    # Labels like "Manufacturers:" are not names.
     if t.endswith(":"):
         return False
     line = t.rstrip(".,;:")
     if not line or not re.search(r"[A-Za-z]", line):
         return False
-    # Sentence tail glued before the first real brand (e.g. "including operating costs.")
+    # Remove sentence fragments that can get glued to names during PDF extraction.
     if re.match(r"^including\s+", line, re.I) and re.search(
         r"\b(cost|costs|fee|fees|expense|operating|maintenance)\b", line, re.I
     ):
@@ -267,7 +266,7 @@ def _looks_like_manufacturer_name(s: str) -> bool:
     sw = len(_MANU_SENTENCE_STOPWORDS.findall(line))
     if sw >= 2:
         return False
-    # Mostly digits (page/sheet noise)
+    # Numeric-only noise usually comes from page headers/footers.
     if re.match(r"^[\d\s\-/]+$", line):
         return False
     return True
@@ -275,15 +274,15 @@ def _looks_like_manufacturer_name(s: str) -> bool:
 
 def _iter_manufacturer_input_fragments(text: str):
     """
-    PDF extract often glues lines with '/'. Yield candidates from newlines and,
-    when needed, split on slashes so plain name lists survive extraction.
+    PDF text often merges list items with '/'.
+    Yield cleaner name candidates by splitting those merged lines.
     """
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         slashes = line.count("/")
-        # Multiple segments merged, or one long line with path-like breaks
+        # Split heavily merged lines so each name can be validated separately.
         if slashes >= 2 or (slashes >= 1 and len(line) > 90):
             for part in re.split(r"\s*/\s*", line):
                 p = part.strip()
@@ -373,7 +372,7 @@ def _strip_json_fence(content: str) -> str:
 
 
 def _claude_response_text(message: object) -> str:
-    """Concatenate text blocks from a Claude Messages API response."""
+    """Join all text blocks from a Claude response into one string."""
     parts: list[str] = []
     for block in getattr(message, "content", []) or []:
         if getattr(block, "type", None) == "text":
@@ -390,7 +389,7 @@ def _years_label(years_value: float) -> str:
 
 
 def _regex_fallback_warranties(text: str) -> str:
-    """Simple regex fallback when the API is unavailable."""
+    """Basic warranty extraction fallback used when AI is unavailable."""
     if not text.strip():
         return ""
     lines_out: list[str] = []
@@ -498,9 +497,7 @@ Text:
         return _regex_fallback_warranties(text)
 
 
-# -----------------------------------------------------------------------------
-# Training
-# -----------------------------------------------------------------------------
+# Training extraction.
 
 
 def extract_training(lines: list[str]) -> str:
@@ -526,9 +523,7 @@ def extract_training(lines: list[str]) -> str:
     return ""
 
 
-# -----------------------------------------------------------------------------
-# Spare parts
-# -----------------------------------------------------------------------------
+# Spare parts extraction.
 
 
 def extract_spare_parts(lines: list[str]) -> str:
@@ -563,9 +558,7 @@ def extract_spare_parts(lines: list[str]) -> str:
     return "\n".join(dict.fromkeys(results))
 
 
-# -----------------------------------------------------------------------------
-# Headers / footers
-# -----------------------------------------------------------------------------
+# Remove repeated header/footer noise before parsing.
 
 
 def remove_headers_footers(lines: list[str]) -> list[str]:
@@ -586,9 +579,7 @@ def remove_headers_footers(lines: list[str]) -> list[str]:
     return cleaned_lines
 
 
-# -----------------------------------------------------------------------------
-# Folder → rows
-# -----------------------------------------------------------------------------
+# Convert all PDFs in a folder into output rows.
 
 
 def process_folder(folder: str | Path) -> list[dict[str, str]]:
@@ -637,7 +628,6 @@ def save_csv(rows: list[dict[str, str]], filename: str | Path) -> None:
         writer.writerows(rows)
 
 
-# -----------------------------------------------------------------------------
 
 
 def main() -> None:

@@ -1,7 +1,10 @@
 """
-Drawing extraction -- native PDF document approach (same as Claude.ai web UI).
-Sends the PDF directly to Claude; Claude processes the full document natively.
-Two-pass: first extract all rows, then fill gaps with a targeted follow-up.
+What this script does:
+- Sends one drawing PDF directly to the model as a  PDF document.
+- Runs extraction in two passes:
+  1) main extraction for all schedule rows
+  2) follow-up check for missed rows
+- Merges results and writes them to a CSV file.
 """
 from dotenv import load_dotenv
 load_dotenv(".env")
@@ -79,11 +82,13 @@ If nothing is missing, return [].
 
 
 def read_pdf_b64(path: str) -> str:
+    """Read a PDF file and return base64 text for API upload."""
     with open(path, "rb") as f:
         return base64.standard_b64encode(f.read()).decode("utf-8")
 
 
 def repair_json(raw: str) -> str:
+    """Try to fix broken quotes in model output before JSON parsing."""
     raw = raw.replace('\u201c', "'").replace('\u201d', "'")
     def fix(m):
         inner = re.sub(r'(?<!\\)"', "'", m.group(1))
@@ -92,6 +97,7 @@ def repair_json(raw: str) -> str:
 
 
 def parse_json(raw: str):
+    """Parse JSON safely, even if response is wrapped in code fences."""
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
     raw = re.sub(r"\n?```$", "", raw)
     for attempt in (raw, repair_json(raw)):
@@ -103,6 +109,7 @@ def parse_json(raw: str):
 
 
 def expand_combined_tags(rows: list) -> list:
+    """Split combined tags like 'ST-1S, ST-1R' into separate rows."""
     out = []
     for row in rows:
         name = str(row.get("equipment_name", "")).strip()
@@ -120,18 +127,24 @@ def expand_combined_tags(rows: list) -> list:
 _TAG_RE = re.compile(r"^[A-Z]{1,6}[-\./][A-Za-z0-9]")
 
 def valid_tag(name: str) -> bool:
+    """Basic check: keep only strings that look like equipment tags."""
     name = name.strip()
     return bool(name) and len(name) <= 30 and bool(_TAG_RE.match(name))
 
 
 def clean_row(row: dict) -> dict:
+    """Normalize extracted row fields and trim trailing separators."""
     cleaned = {f: str(row.get(f, "")).strip() for f in FIELDS}
     cleaned["location_service"] = re.sub(r"\s*/\s*$", "", cleaned["location_service"]).strip()
     return cleaned
 
 
 def merge_rows(existing: list, new_rows: list) -> list:
-    """Add new_rows that are not already present; enrich existing rows with missing fields."""
+    """
+    Merge two extracted row lists by equipment tag.
+    - Add rows not already present
+    - Fill empty fields in existing rows when new data is available
+    """
     by_key = {str(r["equipment_name"]).upper(): r for r in existing}
     order = [str(r["equipment_name"]).upper() for r in existing]
 
@@ -143,7 +156,7 @@ def merge_rows(existing: list, new_rows: list) -> list:
             by_key[key] = row
             order.append(key)
         else:
-            # Fill in any missing fields from the new row
+            # Keep what we already have, but fill blanks from the new pass.
             for field in FIELDS:
                 if not by_key[key].get(field) and row.get(field):
                     by_key[key][field] = row[field]
@@ -151,7 +164,7 @@ def merge_rows(existing: list, new_rows: list) -> list:
     return [by_key[k] for k in order]
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main run starts here.
 
 print(f"Reading: {PDF}")
 pdf_b64 = read_pdf_b64(PDF)
@@ -168,7 +181,7 @@ doc_content = {
     },
 }
 
-# ── Pass 1: full extraction ────────────────────────────────────────────────────
+# Pass 1: main extraction from the full drawing.
 print("Pass 1: full extraction...")
 resp1 = client.beta.messages.create(
     model=MODEL,
@@ -201,7 +214,7 @@ rows1 = [clean_row(r) for r in rows1]
 print(f"  Schedules found: {schedules}")
 print(f"  Rows extracted: {len(rows1)}")
 
-# ── Pass 2: gap-fill follow-up ─────────────────────────────────────────────────
+# Pass 2: ask again only for anything missed in pass 1.
 found_tags = ", ".join(r["equipment_name"] for r in rows1)
 followup_text = FOLLOWUP_PROMPT.format(found=found_tags)
 
@@ -234,7 +247,7 @@ if rows2:
     for r in rows2:
         print(f"    + {r['equipment_name']}")
 
-# ── Merge and save ────────────────────────────────────────────────────────────
+# Merge both passes and write final CSV.
 final = merge_rows(rows1, rows2)
 
 os.makedirs("output", exist_ok=True)
